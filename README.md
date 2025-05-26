@@ -1,7 +1,7 @@
 Created by  MERT ALADAĞ
 https://github.com/mertalada
 
-# IOS AvFoundation and Android MediaCodec Native Module
+# IOS Avfoundation and Android MediaCodec Native Module
 
 # Getting Started
 
