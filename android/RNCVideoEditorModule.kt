@@ -67,78 +67,78 @@ class RNCVideoEditorModule(reactContext: ReactApplicationContext) : ReactContext
     @ReactMethod
     fun mergeAudioWithVideo(videoPath: String, audioPath: String, promise: Promise) {
         try {
-            val outputPath = videoPath + "_merged.mp4"
-            val videoExtractor = MediaExtractor()
-            videoExtractor.setDataSource(videoPath)
+            val outputPath = "${videoPath}_merged.mp4"
 
-            val audioExtractor = MediaExtractor()
-            audioExtractor.setDataSource(audioPath)
+            /* ---------- Extractors ---------- */
+            val vEx = MediaExtractor().apply { setDataSource(videoPath) }
+            val aEx = MediaExtractor().apply { setDataSource(audioPath) }
 
+            /* ---------- Muxer ---------- */
             val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-            var videoTrackIndex = -1
-            for (i in 0 until videoExtractor.trackCount) {
-                val format = videoExtractor.getTrackFormat(i)
-                if (format.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
-                    videoTrackIndex = muxer.addTrack(format)
-                    videoExtractor.selectTrack(i)
+            /* ---- 1. Video track + rotation ---- */
+            var vTrackIx = -1
+            var rotation = 0
+            for (i in 0 until vEx.trackCount) {
+                val fmt = vEx.getTrackFormat(i)
+                if (fmt.getString(MediaFormat.KEY_MIME)!!.startsWith("video/")) {
+                    vTrackIx = muxer.addTrack(fmt); vEx.selectTrack(i)
+                    if (fmt.containsKey(MediaFormat.KEY_ROTATION)) {
+                        rotation = fmt.getInteger(MediaFormat.KEY_ROTATION)
+                    } else {        // bazı cihazlar rotation’ı burada tutmaz
+                        // yedek yol: MetadataRetriever
+                        val retr = MediaMetadataRetriever()
+                        retr.setDataSource(videoPath)
+                        rotation = retr.extractMetadata(
+                            MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION
+                        )?.toInt() ?: 0
+                        retr.release()
+                    }
                     break
                 }
             }
 
-            var audioTrackIndex = -1
-            for (i in 0 until audioExtractor.trackCount) {
-                val format = audioExtractor.getTrackFormat(i)
-                if (format.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
-                    audioTrackIndex = muxer.addTrack(format)
-                    audioExtractor.selectTrack(i)
-                    break
+            /* ---- 2. Audio track ---- */
+            var aTrackIx = -1
+            for (i in 0 until aEx.trackCount) {
+                val fmt = aEx.getTrackFormat(i)
+                if (fmt.getString(MediaFormat.KEY_MIME)!!.startsWith("audio/")) {
+                    aTrackIx = muxer.addTrack(fmt); aEx.selectTrack(i); break
                 }
             }
-
-            if (videoTrackIndex == -1 || audioTrackIndex == -1) {
-                promise.reject("MERGE_ERROR", "Video or Audio track not found")
-                return
+            if (vTrackIx == -1 || aTrackIx == -1) {
+                promise.reject("MERGE_ERROR", "Tracks not found"); return
             }
 
+            /* ---- Rotation metasını ekle ---- */
+            muxer.setOrientationHint(rotation)   // 🔑 DÖNÜŞ BİLGİSİ EKLENDİ
             muxer.start()
 
-            val buffer = ByteArray(1024 * 1024)
-            val bufferInfo = MediaCodec.BufferInfo()
+            val buf = ByteArray(1 shl 20)
+            val info = MediaCodec.BufferInfo()
 
-            // Write Video
-            while (true) {
-                bufferInfo.offset = 0
-                bufferInfo.size = videoExtractor.readSampleData(ByteBuffer.wrap(buffer), 0)
-                if (bufferInfo.size < 0) break
-                bufferInfo.presentationTimeUs = videoExtractor.sampleTime
-                bufferInfo.flags = videoExtractor.sampleFlags
-                muxer.writeSampleData(videoTrackIndex, ByteBuffer.wrap(buffer, 0, bufferInfo.size), bufferInfo)
-                videoExtractor.advance()
+            fun copy(ex: MediaExtractor, trackIx: Int) {
+                while (true) {
+                    info.size = ex.readSampleData(ByteBuffer.wrap(buf), 0)
+                    if (info.size < 0) break
+                    info.offset = 0
+                    info.presentationTimeUs = ex.sampleTime
+                    info.flags = ex.sampleFlags
+                    muxer.writeSampleData(trackIx, ByteBuffer.wrap(buf, 0, info.size), info)
+                    ex.advance()
+                }
             }
 
-            // Write Audio
-            while (true) {
-                bufferInfo.offset = 0
-                bufferInfo.size = audioExtractor.readSampleData(ByteBuffer.wrap(buffer), 0)
-                if (bufferInfo.size < 0) break
-                bufferInfo.presentationTimeUs = audioExtractor.sampleTime
-                bufferInfo.flags = audioExtractor.sampleFlags
-                muxer.writeSampleData(audioTrackIndex, ByteBuffer.wrap(buffer, 0, bufferInfo.size), bufferInfo)
-                audioExtractor.advance()
-            }
+            copy(vEx, vTrackIx); copy(aEx, aTrackIx)
 
-            muxer.stop()
-            muxer.release()
-            videoExtractor.release()
-            audioExtractor.release()
-
+            muxer.stop(); muxer.release(); vEx.release(); aEx.release()
             promise.resolve(outputPath)
 
         } catch (e: Exception) {
             promise.reject("MERGE_ERROR", e.message, e)
         }
     }
+
 
     /* -------------------- NEW METHOD: MP3 ➜ AAC/M4A -------------------- */
 
@@ -150,171 +150,146 @@ class RNCVideoEditorModule(reactContext: ReactApplicationContext) : ReactContext
      *  Yalnızca Android’de kullanılır. AAC (LC) 44.1 kHz / 2 ch / 128 kbps
      *  çıktılı bir M4A dosyası üretir.
      */
-    @ReactMethod
-    fun convertMp3ToM4a(mp3Path: String, promise: Promise) {
-        Thread {
-            var extractor: MediaExtractor? = null
-            var decoder: MediaCodec? = null
-            var encoder: MediaCodec? = null
-            var muxer: MediaMuxer? = null
-            try {
-                val inPath = mp3Path.removePrefix("file://")
-                val outPath = inPath.replace(".mp3", "_aac.m4a")
+     @ReactMethod
+fun convertMp3ToM4a(mp3Path: String, promise: Promise) {
+    Thread {
+        var extractor: MediaExtractor? = null
+        var decoder: MediaCodec? = null
+        var encoder: MediaCodec? = null
+        var muxer:   MediaMuxer? = null
+        try {
+            val inPath  = mp3Path.removePrefix("file://")
+            val outPath = inPath.replace(".mp3", "_aac.m4a")
 
-                /* --- Extractor & decoder (MP3 → PCM) --- */
-                extractor = MediaExtractor()
-                extractor.setDataSource(inPath)
+            /* 1. MP3 track alınır -------------------------------------------------- */
+            extractor = MediaExtractor().apply { setDataSource(inPath) }
 
-                var audioTrack = -1
-                for (i in 0 until extractor.trackCount) {
-                    val f = extractor.getTrackFormat(i)
-                    if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
-                        audioTrack = i
-                        break
-                    }
-                }
-                if (audioTrack == -1) throw Exception("No audio track in MP3")
-
-                extractor.selectTrack(audioTrack)
-                val inputFormat = extractor.getTrackFormat(audioTrack)
-                val mimeIn = inputFormat.getString(MediaFormat.KEY_MIME) ?: "audio/mpeg"
-
-                decoder = MediaCodec.createDecoderByType(mimeIn)
-                decoder!!.configure(inputFormat, null, null, 0)
-                decoder!!.start()
-
-                /* --- Encoder (PCM → AAC) --- */
-                val AAC_MIME = MediaFormat.MIMETYPE_AUDIO_AAC
-                val aacFormat = MediaFormat.createAudioFormat(AAC_MIME, 44100, 2)
-                aacFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-                aacFormat.setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
-                encoder = MediaCodec.createEncoderByType(AAC_MIME)
-                encoder!!.configure(aacFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                encoder!!.start()
-
-                /* --- Muxer --- */
-                muxer = MediaMuxer(outPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                var muxerStarted = false
-                var aacTrackIndex = -1
-
-                val bufferInfo = MediaCodec.BufferInfo()
-                val TIMEOUT_US = 10_000L
-                var sawInputEOS = false
-                var sawDecoderEOS = false
-                var sawEncoderEOS = false
-
-                while (!sawEncoderEOS) {
-                    /* ---------- Feed decoder with MP3 data ---------- */
-                    if (!sawInputEOS) {
-                        val inIndex = decoder!!.dequeueInputBuffer(TIMEOUT_US)
-                        if (inIndex >= 0) {
-                            val buf = decoder!!.getInputBuffer(inIndex)!!
-                            val sampleSize = extractor.readSampleData(buf, 0)
-                            if (sampleSize < 0) {
-                                decoder!!.queueInputBuffer(
-                                    inIndex,
-                                    0,
-                                    0,
-                                    0,
-                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                )
-                                sawInputEOS = true
-                            } else {
-                                val presentationTimeUs = extractor.sampleTime
-                                decoder!!.queueInputBuffer(
-                                    inIndex,
-                                    0,
-                                    sampleSize,
-                                    presentationTimeUs,
-                                    0
-                                )
-                                extractor.advance()
-                            }
-                        }
-                    }
-
-                    /* ---------- Drain decoder (PCM) ---------- */
-                    var decoderOutAvailable = true
-                    while (decoderOutAvailable && !sawDecoderEOS) {
-                        val outIndex = decoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
-                        when {
-                            outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> decoderOutAvailable = false
-                            outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> { /* ignore */ }
-                            outIndex >= 0 -> {
-                                val pcmBuf = decoder!!.getOutputBuffer(outIndex)!!
-                                val pcmSize = bufferInfo.size
-                                val pcmPts = bufferInfo.presentationTimeUs
-                                val flags = bufferInfo.flags
-
-                                /* ---------- Feed encoder with PCM ---------- */
-                                val inEnc = encoder!!.dequeueInputBuffer(TIMEOUT_US)
-                                if (inEnc >= 0) {
-                                    val encBuf = encoder!!.getInputBuffer(inEnc)!!
-                                    encBuf.clear()
-                                    encBuf.put(pcmBuf)
-                                    encoder!!.queueInputBuffer(
-                                        inEnc, 0, pcmSize, pcmPts,
-                                        if (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
-                                            MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                        else 0
-                                    )
-                                }
-
-                                decoder!!.releaseOutputBuffer(outIndex, false)
-                                if (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                                    sawDecoderEOS = true
-                                }
-                            }
-                        }
-                    }
-
-                    /* ---------- Drain encoder (AAC) ---------- */
-                    var encoderOutAvailable = true
-                    while (encoderOutAvailable && !sawEncoderEOS) {
-                        val encIndex = encoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
-                        when {
-                            encIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> encoderOutAvailable = false
-                            encIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                                if (muxerStarted) throw RuntimeException("Format changed twice")
-                                val newFormat = encoder!!.outputFormat
-                                aacTrackIndex = muxer.addTrack(newFormat)
-                                muxer.start()
-                                muxerStarted = true
-                            }
-                            encIndex >= 0 -> {
-                                val encodedBuf = encoder!!.getOutputBuffer(encIndex)!!
-                                if (bufferInfo.size > 0 && muxerStarted) {
-                                    encodedBuf.position(bufferInfo.offset)
-                                    encodedBuf.limit(bufferInfo.offset + bufferInfo.size)
-                                    muxer.writeSampleData(aacTrackIndex, encodedBuf, bufferInfo)
-                                }
-                                val flags = bufferInfo.flags
-                                encoder!!.releaseOutputBuffer(encIndex, false)
-                                if (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                                    sawEncoderEOS = true
-                                }
-                            }
-                        }
-                    }
-                }
-
-                /* --- Release --- */
-                extractor.release()
-                decoder.stop(); decoder.release()
-                encoder.stop(); encoder.release()
-                if (muxerStarted) {
-                    muxer.stop()
-                }
-                muxer.release()
-
-                promise.resolve("file://$outPath")
-            } catch (e: Exception) {
-                promise.reject("CONVERT_ERROR", e.message, e)
-                try { extractor?.release() } catch (_: Exception) {}
-                try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
-                try { encoder?.stop(); encoder?.release() } catch (_: Exception) {}
-                try { muxer?.release() } catch (_: Exception) {}
+            val trackIx = (0 until extractor!!.trackCount).first {
+                extractor!!.getTrackFormat(it)
+                    .getString(MediaFormat.KEY_MIME)!!.startsWith("audio/")
             }
-        }.start()
-    }
+            extractor!!.selectTrack(trackIx)
+
+            val inFmt = extractor!!.getTrackFormat(trackIx)
+            val sampleRate   = inFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            val channelCount = inFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            val mimeIn       = inFmt.getString(MediaFormat.KEY_MIME)!!
+
+            /* 2. Decoder ----------------------------------------------------------- */
+            decoder = MediaCodec.createDecoderByType(mimeIn).apply {
+                configure(inFmt, null, null, 0)
+                start()
+            }
+
+            /* 3. Encoder (AAC) ------------------------------------------------------ */
+            val aacFmt = MediaFormat.createAudioFormat(
+                MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount
+            ).apply {
+                setInteger(
+                    MediaFormat.KEY_AAC_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AACObjectLC
+                )
+                setInteger(MediaFormat.KEY_BIT_RATE, 128000)
+            }
+            encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
+                configure(aacFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                start()
+            }
+
+            /* 4. Muxer ------------------------------------------------------------- */
+            muxer = MediaMuxer(outPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            var muxStarted = false
+            var aacTrack   = -1
+
+            val info    = MediaCodec.BufferInfo()
+            val TIMEOUT = 10_000L
+            var inEOS = false
+            var decEOS = false
+            var encEOS = false
+
+            while (!encEOS) {
+
+                /* feed decoder --------------------------------------------------- */
+                if (!inEOS) {
+                    val inIdx = decoder!!.dequeueInputBuffer(TIMEOUT)
+                    if (inIdx >= 0) {
+                        val inBuf = decoder!!.getInputBuffer(inIdx)!!
+                        val sz = extractor!!.readSampleData(inBuf, 0)
+                        if (sz < 0) {
+                            decoder!!.queueInputBuffer(
+                                inIdx, 0, 0, 0,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            inEOS = true
+                        } else {
+                            decoder!!.queueInputBuffer(
+                                inIdx, 0, sz, extractor!!.sampleTime, 0
+                            )
+                            extractor!!.advance()
+                        }
+                    }
+                }
+
+                /* decoder → encoder (chunk-safe) --------------------------------- */
+                var decOut = decoder!!.dequeueOutputBuffer(info, TIMEOUT)
+                while (decOut >= 0) {
+                    val pcm = decoder!!.getOutputBuffer(decOut)!!
+                    val endFlag = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM
+
+                    while (pcm.hasRemaining()) {
+                        val inEnc = encoder!!.dequeueInputBuffer(TIMEOUT)
+                        if (inEnc < 0) break
+                        val encBuf = encoder!!.getInputBuffer(inEnc)!!
+                        encBuf.clear()
+
+                        val chunk = ByteArray(min(encBuf.remaining(), pcm.remaining()))
+                        pcm.get(chunk)
+                        encBuf.put(chunk)
+
+                        encoder!!.queueInputBuffer(
+                            inEnc, 0, chunk.size, info.presentationTimeUs,
+                            if (!pcm.hasRemaining() && endFlag != 0)
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                        )
+                    }
+                    decoder!!.releaseOutputBuffer(decOut, false)
+                    if (endFlag != 0) decEOS = true
+                    decOut = decoder!!.dequeueOutputBuffer(info, 0)
+                }
+
+                /* encoder → muxer -------------------------------------------------- */
+                var encOut = encoder!!.dequeueOutputBuffer(info, TIMEOUT)
+                while (encOut >= 0) {
+                    if (!muxStarted) {
+                        aacTrack = muxer!!.addTrack(encoder!!.outputFormat)
+                        muxer!!.start(); muxStarted = true
+                    }
+                    if (info.size > 0) {
+                        val aBuf = encoder!!.getOutputBuffer(encOut)!!
+                        muxer!!.writeSampleData(aacTrack, aBuf, info)
+                    }
+                    val eEnd = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                    encoder!!.releaseOutputBuffer(encOut, false)
+                    if (eEnd != 0) encEOS = true
+                    encOut = encoder!!.dequeueOutputBuffer(info, 0)
+                }
+            }
+
+            decoder!!.stop(); decoder!!.release()
+            encoder!!.stop(); encoder!!.release()
+            if (muxStarted) muxer!!.stop()
+            muxer!!.release(); extractor!!.release()
+
+            promise.resolve("file://$outPath")
+
+        } catch (e: Exception) {
+            promise.reject("CONVERT_ERROR", e.message, e)
+            try { extractor?.release() }      catch(_:Exception){}
+            try { decoder?.stop(); decoder?.release() } catch(_:Exception){}
+            try { encoder?.stop(); encoder?.release() } catch(_:Exception){}
+            try { muxer?.release() }          catch(_:Exception){}
+        }
+    }.start()
+}
+
 }
